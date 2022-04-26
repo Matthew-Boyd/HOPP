@@ -4,23 +4,58 @@ import traceback
 from typing import Callable
 
 
-SIMULATION_ATTRIBUTES = ['annual_energies', 'generation_profile', 'internal_rate_of_returns',
-                         'lcoe_nom', 'lcoe_real', 'net_present_values', 'cost_installed',
-                         'total_revenues', 'capacity_payments', 'energy_purchases_values',
-                         'energy_sales_values', 'energy_values', 'benefit_cost_ratios']
+# SIMULATION_ATTRIBUTES = ['annual_energies', 'generation_profile', 'internal_rate_of_returns',
+#                          'lcoe_nom', 'lcoe_real', 'net_present_values', 'cost_installed',
+#                          'total_revenues', 'capacity_payments', 'energy_purchases_values',
+#                          'energy_sales_values', 'energy_values', 'benefit_cost_ratios']
+#
+# TOWER_ATTRIBUTES = ['dispatch', 'ssc_time_series']
 
-TOWER_ATTRIBUTES = ['dispatch', 'ssc_time_series']
+def shrink_financial_model(model_dict):
+    TIMESTEPS_YEAR = 8760
+    shrink_keys = {'SystemOutput': ['gen', 'system_pre_curtailment_kwac'],
+                   'Outputs':      ['gen_purchases', 'revenue_gen']}
+
+    for main_key in shrink_keys.keys():
+        for sub_key in  shrink_keys[main_key]:
+            if sub_key in model_dict[main_key].keys():
+                model_dict[main_key][sub_key] = model_dict[main_key][sub_key][:TIMESTEPS_YEAR]
+
+    return model_dict
+
+
+def expand_financial_model(model_dict):
+    TIMESTEPS_YEAR = 8760
+    ANALYSIS_PERIOD = len(model_dict['Outputs']['cf_annual_costs']) - 1
+    shrink_keys = {'SystemOutput': ['gen', 'system_pre_curtailment_kwac'],
+                   'Outputs': ['gen_purchases', 'revenue_gen']}
+
+    for main_key in shrink_keys.keys():
+        for sub_key in shrink_keys[main_key]:
+            if sub_key in model_dict[main_key].keys():
+                if len(model_dict[main_key][sub_key]) != TIMESTEPS_YEAR * ANALYSIS_PERIOD:
+                    model_dict[main_key][sub_key] = model_dict[main_key][sub_key] * ANALYSIS_PERIOD
+
+    return model_dict
+
 
 class HybridSizingProblem():  # OptimizationProblem (unwritten base)
     """
     Problem class holding the design variable definitions and executing the HOPP simulation
     """
-    sep = '::'
+    sep = '__'
+    DEFAULT_OPTIONS = dict(time_series_outputs=False, # add soc and curtailed series outputs
+                           dispatch_factors=False,    # add dispatch factors to objective output
+                           generation_profile=False,  # add technology generation profile to output
+                           financial_model=False,     # add financial model dictionary to output
+                           shrink_output=False,       # keep only the first year of output
+                           )
 
     def __init__(self,
                  init_simulation: Callable,
                  design_variables: dict,
-                 fixed_variables: dict = {}) -> None:
+                 fixed_variables: dict = {},
+                 output_options: dict = {}) -> None:
         """
         Create the problem instance, the simulation is not created until the objective is evauated
 
@@ -49,6 +84,8 @@ class HybridSizingProblem():  # OptimizationProblem (unwritten base)
         self.simulation = None
         self.init_simulation = init_simulation
         self._parse_design_variables(design_variables, fixed_variables)
+        self.options = self.DEFAULT_OPTIONS.copy()
+        self.options.update(output_options)
 
     def _parse_design_variables(self,
                                 design_variables: dict,
@@ -156,6 +193,34 @@ class HybridSizingProblem():  # OptimizationProblem (unwritten base)
                 setattr(tech_model, key, value)
             else:
                 tech_model.value(key, value)
+            
+            # force consistent hybrid sizing # TODO: Remove
+            if tech_key == 'tower' and key == 'cycle_capacity_kw':
+            
+                if 'battery' in self.simulation.power_sources.keys():
+                    batt_model = getattr(self.simulation, 'battery')
+                    
+                    csp_cycle = value
+                    total_batt = (100*1e3) - csp_cycle
+
+                    key = 'system_capacity_kw'
+                    
+                    if hasattr(batt_model, key):
+                        setattr(batt_model, key, total_batt)
+                    else:
+                        batt_model.value(key, total_batt)
+                        
+            # elif tech_key == 'pv' and key == 'dc_ac_ratio':
+                
+                # total_pv = (100*1e3) * value
+
+                # key = 'system_capacity_kw'
+                
+                # if hasattr(tech_model, key):
+                    # setattr(tech_model, key, total_pv)
+                # else:
+                    # tech_model.value(key, total_pv)
+               
 
     def candidate_from_array(self, values: np.array) -> tuple:
         """
@@ -196,7 +261,8 @@ class HybridSizingProblem():  # OptimizationProblem (unwritten base)
         """
         try:
             # init dictionary to hold simulation output
-            result = dict()
+            # result = dict()
+            result = {field: val for field, val in candidate}
 
             ## We are doing this because it ensures we start from a clean plant state
             # if the simulation has been initialized, then delete
@@ -209,48 +275,63 @@ class HybridSizingProblem():  # OptimizationProblem (unwritten base)
             # Check if valid candidate, update simulation, execute simulation
             self._check_candidate(candidate)
             self._set_simulation_to_candidate(candidate)
+            
+            # return
             self.simulation.simulate()
 
-            # Create the result dictionary according to SIMULATION_ATTRIBUTES and simulation.power_sources.keys()
-            tech_list = list(self.simulation.power_sources.keys()) + ['hybrid']
-            _ = tech_list.pop(tech_list.index('grid'))
+            result.update(self.simulation.hybrid_simulation_outputs().copy())
+            
+            if self.options['time_series_outputs']:                
+                # CSP TES SOC
+                if 'tower' in self.simulation.power_sources.keys():
+                    model = self.simulation.power_sources['tower']
+                    result['tes_soc'] = model.outputs.ssc_time_series['e_ch_tes'][:8760]
+                    result['rec_thermal'] = model.outputs.ssc_time_series['Q_thermal'][:8760]
+                    
+                # Battery SOC
+                if 'battery' in self.simulation.power_sources.keys():
+                    model = self.simulation.power_sources['battery']
+                    result['bat_soc'] = model.Outputs.SOC[:8760]
+                
+                # Curtailment
+                if 'grid' in self.simulation.power_sources.keys():
+                    model = self.simulation.power_sources['grid']
+                    result['curtailed'] = model.generation_curtailed[:8760]
 
-            # for each of teh simulation attributes
-            for sim_output in SIMULATION_ATTRIBUTES:
-                # for each key of tech_list
-                for key in tech_list:
-                    # get the simulation output
-                    value = getattr(getattr(self.simulation, sim_output), key)
+            if self.options['generation_profile']:
+                for source in self.simulation.power_sources.keys():
+                    attr = 'generation_profile'
+                    o_name = source.capitalize() + ' Generation Profile (MWh)'
+                    try:
+                        result[o_name] = getattr(getattr(self.simulation, attr), source) # list
+                    except AttributeError:
+                        continue
 
-                    # if value is callable, then call to get output
-                    if not callable(value):
-                        temp = {key: value}
-                    else:
-                        temp = {key: value()}
+            if self.options['financial_model']:
+                for source, model in self.simulation.power_sources.items():
+                    attr = '_financial_model'
+                    o_name = source.capitalize() + attr
+                    try:
+                        temp = getattr(model, attr).export() # dict
 
-                    # either update output or add it as a new output
-                    if sim_output in result.keys():
-                        result[sim_output].update(temp)
-                    else:
-                        result[sim_output] = temp
-
-            # result['tower_outputs'] = dict()
-            # for tower_output in TOWER_ATTRIBUTES:
-            #     try:
-            #         value = getattr(self.simulation.tower.outputs, tower_output)
-            #
-            #         result['tower_outputs'][tower_output] = value
-            #
-            #     except Exception:
-            #         err_str = traceback.format_exc()
-            #         result['tower_output_exception'] = err_str
+                        if self.options['shrink_output']:
+                            result[o_name] = shrink_financial_model(temp)
+                        else:
+                            result[o_name] = temp
+                    except AttributeError:
+                        continue 
 
             # Add the dispatch factors, which are the pricing signal in the optimization problem
-            result['dispatch_factors'] = self.simulation.dispatch_factors
+            if self.options['dispatch_factors']:
+                result['dispatch_factors'] = self.simulation.dispatch_factors
 
         except Exception:
-            # Some exception occured while evaluating the objective, capture and document in the output
+            # Some exception occurred while evaluating the objective, capture and document in the output
             err_str = traceback.format_exc()
             result['exception'] = err_str
 
-        return candidate, result
+            print(f'Candidate:\n{candidate}\n')
+            print(f'produced an exception:\n{err_str}\n')
+
+
+        return result

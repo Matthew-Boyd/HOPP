@@ -59,7 +59,9 @@ class HybridDispatch(Dispatch):
         ##################################
         self._create_grid_constraints(hybrid, t)
         if 'battery' in self.power_sources.keys():
-            if not self.options.grid_charging:
+            if self.options.pv_charging_only:
+                self._create_pv_battery_limitation(hybrid)
+            elif not self.options.grid_charging:
                 self._create_grid_battery_limitation(hybrid)
 
     @staticmethod
@@ -147,8 +149,6 @@ class HybridDispatch(Dispatch):
         self.power_source_gen_vars[t].append(hybrid.battery_discharge)
         self.load_vars[t].append(hybrid.battery_charge)
 
-        # TODO: add lifecycle cost port variables...
-
     def _create_battery_port(self, hybrid, t):
         hybrid.battery_port = Port(initialize={'charge_power': hybrid.battery_charge,
                                                'discharge_power': hybrid.battery_discharge})
@@ -164,20 +164,20 @@ class HybridDispatch(Dispatch):
             doc="System load [MW]",
             domain=pyomo.NonNegativeReals,
             units=u.MW)
-        hybrid.electricity_sales = pyomo.Var(
-            doc="Electricity sells value [$]",
+        hybrid.electricity_sold = pyomo.Var(
+            doc="Electricity sold [MW]",
             domain=pyomo.NonNegativeReals,
-            units=u.USD)
-        hybrid.electricity_purchases = pyomo.Var(
-            doc="Electricity purchases value [$]",
+            units=u.MW)
+        hybrid.electricity_purchased = pyomo.Var(
+            doc="Electricity purchased [MW]",
             domain=pyomo.NonNegativeReals,
-            units=u.USD)
+            units=u.MW)
 
     def _create_grid_port(self, hybrid, t):
         hybrid.grid_port = Port(initialize={'system_generation': hybrid.system_generation,
                                             'system_load': hybrid.system_load,
-                                            'electricity_sales': hybrid.electricity_sales,
-                                            'electricity_purchases': hybrid.electricity_purchases})
+                                            'electricity_sold': hybrid.electricity_sold,
+                                            'electricity_purchased': hybrid.electricity_purchased})
         self.ports[t].append(hybrid.grid_port)
 
     def _create_grid_constraints(self, hybrid, t):
@@ -194,6 +194,12 @@ class HybridDispatch(Dispatch):
         hybrid.no_grid_battery_charge = pyomo.Constraint(
             doc="Battery storage cannot charge via the grid",
             expr=hybrid.system_generation >= hybrid.battery_charge)
+
+    @staticmethod
+    def _create_pv_battery_limitation(hybrid):
+        hybrid.only_pv_battery_charge = pyomo.Constraint(
+            doc="Battery storage can only charge from pv",
+            expr=hybrid.pv_generation >= hybrid.battery_charge)
 
     def create_arcs(self):
         ##################################
@@ -229,10 +235,13 @@ class HybridDispatch(Dispatch):
         def gross_profit_objective_rule(m):
             objective = 0.0
             for tech in self.power_sources.keys():
-                # TODO: Update using technology specific model parameters.
                 if tech == 'grid':
-                    objective += sum(self.blocks[t].time_weighting_factor * self.blocks[t].electricity_sales
-                                     - (1/self.blocks[t].time_weighting_factor) * self.blocks[t].electricity_purchases
+                    tb = self.power_sources[tech].dispatch.blocks
+                    objective += sum(self.blocks[t].time_weighting_factor * tb[t].time_duration
+                                     * tb[t].electricity_sell_price * self.blocks[t].electricity_sold
+                                     - (1/self.blocks[t].time_weighting_factor) * tb[t].time_duration
+                                     * tb[t].electricity_purchase_price * self.blocks[t].electricity_purchased
+                                     - tb[t].epsilon * tb[t].is_generating
                                      for t in self.blocks.index_set())
                 elif tech == 'pv':
                     tb = self.power_sources[tech].dispatch.blocks
@@ -263,8 +272,9 @@ class HybridDispatch(Dispatch):
                                      * (tb[t].cost_per_charge * self.blocks[t].battery_charge
                                         + tb[t].cost_per_discharge * self.blocks[t].battery_discharge)
                                      for t in self.blocks.index_set())
-            # TODO: how should battery life cycle costs be accounted
-            #objective -= self.model.lifecycle_cost * self.model.lifecycles
+                    tb = self.power_sources['battery'].dispatch
+                    if tb.include_lifecycle_count:
+                        objective -= tb.model.lifecycle_cost * tb.model.lifecycles
             return objective
 
         self.model.objective = pyomo.Objective(
@@ -332,8 +342,14 @@ class HybridDispatch(Dispatch):
 
     @property
     def electricity_sales(self) -> list:
-        return [self.blocks[t].electricity_sales.value for t in self.blocks.index_set()]
+        if 'grid' in self.power_sources:
+            tb = self.power_sources['grid'].dispatch.blocks
+            return [tb[t].time_duration.value * tb[t].electricity_sell_price.value
+                    * self.blocks[t].electricity_sold.value for t in self.blocks.index_set()]
 
     @property
     def electricity_purchases(self) -> list:
-        return [self.blocks[t].electricity_purchases.value for t in self.blocks.index_set()]
+        if 'grid' in self.power_sources:
+            tb = self.power_sources['grid'].dispatch.blocks
+            return [tb[t].time_duration.value * tb[t].electricity_purchase_price.value
+                    * self.blocks[t].electricity_purchased.value for t in self.blocks.index_set()]

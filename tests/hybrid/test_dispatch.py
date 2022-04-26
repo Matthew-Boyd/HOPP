@@ -68,8 +68,8 @@ def test_solar_dispatch(site):
                               units=u.USD / u.MWh)
 
     def create_test_objective_rule(m):
-        return sum((m.pv[i].time_duration * m.price[i] * m.pv[i].generation
-                    - m.pv[i].generation_cost) for i in m.pv.index_set())
+        return sum((m.pv[i].time_duration * (m.price[i] - m.pv[i].cost_per_generation) * m.pv[i].generation)
+                   for i in m.pv.index_set())
 
     model.test_objective = pyomo.Objective(
         rule=create_test_objective_rule,
@@ -78,15 +78,17 @@ def test_solar_dispatch(site):
     assert_units_consistent(model)
 
     solar.dispatch.initialize_parameters()
+    solar.dc_degradation = [0.5] * 1
     solar.simulate(1)
 
     solar.dispatch.update_time_series_parameters(0)
 
     results = HybridDispatchBuilderSolver.glpk_solve_call(model)
     # results = HybridDispatchBuilderSolver.cbc_solve_call(model)
+    # results = HybridDispatchBuilderSolver.xpress_solve_call(model)
     assert results.solver.termination_condition == TerminationCondition.optimal
 
-    assert pyomo.value(model.test_objective) == pytest.approx(expected_objective, 10)
+    assert pyomo.value(model.test_objective) == pytest.approx(expected_objective, 1e-3)
     available_resource = solar.generation_profile[0:dispatch_n_look_ahead]
     dispatch_generation = solar.dispatch.generation
     for t in model.forecast_horizon:
@@ -94,7 +96,7 @@ def test_solar_dispatch(site):
 
 
 def test_csp_dispatch_model(site):
-    expected_objective = 222414.39234292
+    expected_objective = 217896.9003
     dispatch_n_look_ahead = 48
 
     model = pyomo.ConcreteModel(name='csp')
@@ -122,7 +124,7 @@ def test_csp_dispatch_model(site):
         return sum(m.csp[t].time_duration * m.price[t] * m.csp[t].cycle_generation
                    - m.csp[t].cost_per_field_generation * m.csp[t].receiver_thermal_power * m.csp[t].time_duration
                    - m.csp[t].cost_per_field_start * m.csp[t].incur_field_start
-                   - m.csp[t].cost_per_cycle_generation * m.csp[t].cycle_generation  * m.csp[t].time_duration
+                   - m.csp[t].cost_per_cycle_generation * m.csp[t].cycle_generation * m.csp[t].time_duration
                    - m.csp[t].cost_per_cycle_start * m.csp[t].incur_cycle_start
                    - m.csp[t].cost_per_change_thermal_input * m.csp[t].cycle_thermal_ramp for t in m.csp.index_set())
 
@@ -186,7 +188,7 @@ def test_csp_dispatch_model(site):
 
 def test_tower_dispatch(site):
     """Tests setting up tower dispatch using system model and running simulation with dispatch"""
-    expected_objective = 100804.46140677073
+    expected_objective = 99485.378
     dispatch_n_look_ahead = 48
 
     tower = TowerPlant(site, technologies['tower'])
@@ -335,8 +337,8 @@ def test_wind_dispatch(site):
                               units=u.USD / u.MWh)
 
     def create_test_objective_rule(m):
-        return sum((m.wind[t].time_duration * m.price[t] * m.wind[t].generation
-                    - m.wind[t].generation_cost) for t in m.wind.index_set())
+        return sum((m.wind[t].time_duration * (m.price[t] - m.wind[t].cost_per_generation) * m.wind[t].generation)
+                   for t in m.wind.index_set())
 
     model.test_objective = pyomo.Objective(
         rule=create_test_objective_rule,
@@ -360,7 +362,7 @@ def test_wind_dispatch(site):
 
 
 def test_simple_battery_dispatch(site):
-    expected_objective = 31299.2696
+    expected_objective = 28964.8493
     dispatch_n_look_ahead = 48
 
     battery = Battery(site, technologies['battery'])
@@ -393,8 +395,10 @@ def test_simple_battery_dispatch(site):
                               units=u.USD / u.MWh)
 
     def create_test_objective_rule(m):
-        return sum((m.battery[t].time_duration * m.price[t] * (m.battery[t].discharge_power - m.battery[t].charge_power)
-                    - m.battery[t].discharge_cost - m.battery[t].charge_cost) for t in m.battery.index_set())
+        return sum((m.battery[t].time_duration * (
+                (m.price[t] - m.battery[t].cost_per_discharge) * m.battery[t].discharge_power
+                - (m.price[t] + m.battery[t].cost_per_charge) * m.battery[t].charge_power))
+                   for t in m.battery.index_set())
 
     model.test_objective = pyomo.Objective(
         rule=create_test_objective_rule,
@@ -420,8 +424,8 @@ def test_simple_battery_dispatch(site):
 
 
 def test_simple_battery_dispatch_lifecycle_count(site):
-    expected_objective = 26620.7096
-    expected_lifecycles = 2.339
+    expected_objective = 17032.2174
+    expected_lifecycles = 2.2514
 
     dispatch_n_look_ahead = 48
 
@@ -454,11 +458,10 @@ def test_simple_battery_dispatch_lifecycle_count(site):
                               units=u.USD / u.MWh)
 
     def create_test_objective_rule(m):
-        return (sum((m.battery[t].time_duration
-                     * m.price[t]
-                     * (m.battery[t].discharge_power - m.battery[t].charge_power)
-                     - m.battery[t].discharge_cost
-                     - m.battery[t].charge_cost) for t in m.battery.index_set())
+        return (sum((m.battery[t].time_duration * (
+                (m.price[t] - m.battery[t].cost_per_discharge) * m.battery[t].discharge_power
+                - (m.price[t] + m.battery[t].cost_per_charge) * m.battery[t].charge_power))
+                   for t in m.battery.index_set())
                 - m.lifecycle_cost * m.lifecycles)
 
     model.test_objective = pyomo.Objective(
@@ -483,8 +486,8 @@ def test_simple_battery_dispatch_lifecycle_count(site):
 
 
 def test_detailed_battery_dispatch(site):
-    expected_objective = 35221.192
-    expected_lifecycles = 0.292799
+    expected_objective = 34337.1383
+    expected_lifecycles = 0.267895
     # TODO: McCormick error is large enough to make objective 50% higher than
     #  the value of simple battery dispatch objective
 
@@ -518,11 +521,10 @@ def test_detailed_battery_dispatch(site):
                               units=u.USD / u.MWh)
 
     def create_test_objective_rule(m):
-        return (sum((m.convex_LV_battery[t].time_duration
-                     * m.price[t]
-                     * (m.convex_LV_battery[t].discharge_power - m.convex_LV_battery[t].charge_power)
-                     - m.convex_LV_battery[t].discharge_cost
-                     - m.convex_LV_battery[t].charge_cost) for t in m.convex_LV_battery.index_set())
+        return (sum((m.convex_LV_battery[t].time_duration * (
+                (m.price[t] - m.convex_LV_battery[t].cost_per_discharge) * m.convex_LV_battery[t].discharge_power
+                - (m.price[t] + m.convex_LV_battery[t].cost_per_charge) * m.convex_LV_battery[t].charge_power))
+                   for t in m.convex_LV_battery.index_set())
                 - m.lifecycle_cost * m.lifecycles)
 
     model.test_objective = pyomo.Objective(
@@ -550,13 +552,16 @@ def test_detailed_battery_dispatch(site):
 
 
 def test_pv_wind_battery_hybrid_dispatch(site):
-    expected_objective = 36199.308
+    expected_objective = 35628.7814
 
     wind_solar_battery = {key: technologies[key] for key in ('pv', 'wind', 'battery', 'grid')}
     hybrid_plant = HybridSimulation(wind_solar_battery, site, technologies['grid'] * 1000,
-                                    dispatch_options={'grid_charging': False})
+                                    dispatch_options={'grid_charging': False,
+                                                      'include_lifecycle_count': False})
     hybrid_plant.grid.value("federal_tax_rate", (0., ))
     hybrid_plant.grid.value("state_tax_rate", (0., ))
+    hybrid_plant.pv.dc_degradation = [0.5] * 1
+
     hybrid_plant.pv.simulate(1)
     hybrid_plant.wind.simulate(1)
 
@@ -590,7 +595,7 @@ def test_pv_wind_battery_hybrid_dispatch(site):
     transmission_limit = hybrid_plant.grid.value('grid_interconnection_limit_kwac')
     system_generation = hybrid_plant.grid.dispatch.system_generation
     for t in hybrid_plant.dispatch_builder.pyomo_model.forecast_horizon:
-        assert system_generation[t] * 1e3 <= transmission_limit
+        assert system_generation[t] * 1e3 <= transmission_limit + 1e-3
         assert system_generation[t] * 1e3 >= 0.0
 
 
@@ -627,13 +632,14 @@ def test_hybrid_dispatch_one_cycle_heuristic(site):
     
 
 def test_hybrid_solar_battery_dispatch(site):
-    expected_objective = 31871.107
+    expected_objective = 22530.3791
 
-    solar_battery_technologies = {k: technologies[k] for k in ('pv', 'battery', 'grid')}
+    solar_battery_technologies = {k: technologies[k] for k in ('pv', 'battery')}
     hybrid_plant = HybridSimulation(solar_battery_technologies, site, technologies['grid'] * 1000,
                                     dispatch_options={'grid_charging': False})
     hybrid_plant.grid.value("federal_tax_rate", (0., ))
     hybrid_plant.grid.value("state_tax_rate", (0., ))
+    hybrid_plant.pv.dc_degradation = [0.5] * 1
     hybrid_plant.pv.simulate(1)
 
     hybrid_plant.dispatch_builder.dispatch.initialize_parameters()
@@ -684,3 +690,68 @@ def test_hybrid_dispatch_financials(site):
     hybrid_plant.simulate(1)
 
     assert sum(hybrid_plant.battery.Outputs.P) < 0.0
+
+
+def test_desired_schedule_dispatch():
+
+    # Creating a contrived schedule
+    daily_schedule = [technologies['grid']]*10
+    daily_schedule.extend([20] * 8)
+    daily_schedule.append(technologies['grid'] + 5)
+    daily_schedule.extend([0] * 5)
+    desired_schedule = daily_schedule*365
+
+    desired_schedule_site = SiteInfo(flatirons_site,
+                                     desired_schedule=desired_schedule)
+    tower_pv_battery = {key: technologies[key] for key in ('pv', 'tower', 'battery', 'grid')}
+
+    # Default case doesn't leave enough head room for battery operations
+    tower_pv_battery['tower'] = {'cycle_capacity_kw': 35 * 1000,
+                                 'solar_multiple': 2.0,
+                                 'tes_hours': 10.0}
+
+    tower_pv_battery['pv'] = {'system_capacity_kw': 80 * 1000}
+
+    hybrid_plant = HybridSimulation(tower_pv_battery, desired_schedule_site, technologies['grid'] * 1000,
+                                    dispatch_options={'is_test_start_year': True,
+                                                      'is_test_end_year': False,
+                                                      'grid_charging': False,
+                                                      'pv_charging_only': True,
+                                                      'include_lifecycle_count': False
+                                                      })
+
+    # Constant price
+    # hybrid_plant.site.elec_prices = [100] * hybrid_plant.site.n_timesteps
+    hybrid_plant.simulate(1)
+
+    system_generation = hybrid_plant.dispatch_builder.dispatch.system_generation
+    system_load = hybrid_plant.dispatch_builder.dispatch.system_load
+    electricity_sold = hybrid_plant.grid.dispatch.electricity_sold
+    electricity_purchased = hybrid_plant.grid.dispatch.electricity_purchased
+    gen_limit = hybrid_plant.grid.dispatch.generation_transmission_limit
+    transmission_limit = hybrid_plant.grid.value('grid_interconnection_limit_kwac')
+
+    schedule = daily_schedule*2
+    # System generation does not exceed schedule limits
+    for t in hybrid_plant.dispatch_builder.pyomo_model.forecast_horizon:
+        assert gen_limit[t] * 1e3 <= transmission_limit
+        assert system_generation[t] - system_load[t] <= schedule[t] + 1e-3
+        if system_generation[t] > system_load[t]:
+            assert electricity_sold[t] == pytest.approx(system_generation[t] - system_load[t], 1e-3)
+            assert electricity_purchased[t] == pytest.approx(0.0, 1e-3)
+        else:
+            assert electricity_purchased[t] == pytest.approx(system_load[t] - system_generation[t], 1e-3)
+            assert electricity_sold[t] == pytest.approx(0.0, 1e-3)
+
+    # Battery charges and discharges
+    assert sum(hybrid_plant.battery.dispatch.charge_power) > 0.0
+    assert sum(hybrid_plant.battery.dispatch.discharge_power) > 0.0
+
+    # PV can be curtailed
+    assert sum(hybrid_plant.pv.dispatch.generation) <= sum(hybrid_plant.pv.dispatch.available_generation)
+
+    # CSP can run
+    assert sum(hybrid_plant.tower.dispatch.cycle_generation) > 0.0
+    assert sum(hybrid_plant.tower.dispatch.receiver_thermal_power) > 0.0
+
+

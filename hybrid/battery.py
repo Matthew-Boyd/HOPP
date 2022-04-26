@@ -44,11 +44,11 @@ class Battery(PowerSource):
                 raise ValueError
 
         system_model = BatteryModel.default(chemistry)
-        self.system_capacity_kw: float = battery_config['system_capacity_kw']
         financial_model = Singleowner.from_existing(system_model, "GenericBatterySingleOwner")
         super().__init__("Battery", site, system_model, financial_model)
 
         self.Outputs = Battery_Outputs(n_timesteps=site.n_timesteps)
+        self.system_capacity_kw: float = battery_config['system_capacity_kw']
         self.chemistry = chemistry
         BatteryTools.battery_model_sizing(self._system_model,
                                           battery_config['system_capacity_kw'],
@@ -122,7 +122,7 @@ class Battery(PowerSource):
         Sets the system capacity and updates the system, cost and financial model
         :param size_kw:
         """
-        # TODO: update financial model?
+        self._financial_model.value("system_capacity", size_kw)
         self._system_capacity_kw = size_kw
 
     @property
@@ -211,7 +211,14 @@ class Battery(PowerSource):
                 if attr == 'gen':
                     getattr(self.Outputs, attr)[time_step] = self.value('P')
 
-    def simulate_financials(self, project_life):
+    def simulate_financials(self, interconnect_kw, project_life, cap_cred_avail_storage: bool = True):
+        """
+        :param: project_life:
+        :param: cap_cred_avail_storage: Base capacity credit on available storage (True),
+                                            otherwise use only dispatched generation (False)
+        """
+        self._financial_model.BatterySystem.batt_computed_bank_capacity = self.system_capacity_kwh
+
         # TODO: updated replacement values -> based on usage...
         try:
             self._financial_model.BatterySystem.batt_bank_replacement
@@ -223,27 +230,31 @@ class Battery(PowerSource):
         else:
             self._financial_model.Lifetime.system_use_lifetime_output = 0
         self._financial_model.FinancialParameters.analysis_period = project_life
-
-        self._financial_model.value("construction_financing_cost", self.get_construction_financing_cost())
+        self._financial_model.CapacityPayments.cp_system_nameplate = min(interconnect_kw, self.system_capacity_kw)
         self._financial_model.Revenue.ppa_soln_mode = 1
-        # TODO: out to get SystemOutput.gen to populate?
-        # if len(self._financial_model.SystemOutput.gen) == self.site.n_timesteps:
+
         if len(self.Outputs.gen) == self.site.n_timesteps:
             single_year_gen = self.Outputs.gen
             self._financial_model.SystemOutput.gen = list(single_year_gen) * project_life
 
             self._financial_model.SystemOutput.system_pre_curtailment_kwac = list(single_year_gen) * project_life
             self._financial_model.SystemOutput.annual_energy_pre_curtailment_ac = sum(single_year_gen)
+            self._financial_model.Battery.batt_annual_discharge_energy = [sum(i for i in self.Outputs.gen if i > 0) / (
+                    len(self.Outputs.gen) / 8760)] * project_life
+        else:
+            raise NotImplementedError
 
-        self.gen_max_feasible = self.calc_gen_max_feasible_kwh()      # need to store for later grid aggregation
+        # need to store for later grid aggregation
+        self.gen_max_feasible = self.calc_gen_max_feasible_kwh(interconnect_kw, cap_cred_avail_storage)
         self.capacity_credit_percent = self.calc_capacity_credit_percent(
-            self.net_load_hourly_year(self.site.data['year']),
-            self.gen_max_feasible)
+            self.site.capacity_hours,
+            self.gen_max_feasible,
+            interconnect_kw)
 
         self._financial_model.execute(0)
         logger.info("{} simulation executed".format('battery'))
 
-    def calc_gen_max_feasible_kwh(self) -> list:
+    def calc_gen_max_feasible_kwh(self, interconnect_kw, use_avail_storage: bool = True) -> list:
         """
         Calculates the maximum feasible capacity (generation profile) that could have occurred.
 
@@ -258,17 +269,37 @@ class Battery(PowerSource):
         def max_feasible_kwh(row):
             return min(self.system_capacity_kw * t_step, row.E_delivered + row.E_stored)
 
-        E_max_feasible = df.apply(max_feasible_kwh, axis=1)                             # [kWh]
+        if use_avail_storage:
+            E_max_feasible = df.apply(max_feasible_kwh, axis=1)                             # [kWh]
+        else:
+            E_max_feasible = df['E_delivered']
+
+        W_ac_nom = self.calc_nominal_capacity(interconnect_kw)
+        E_max_feasible = np.minimum(E_max_feasible, W_ac_nom*t_step) 
+        
         return list(E_max_feasible)
 
     @property
-    def generation_profile(self) -> list:
+    def generation_profile(self) -> Sequence:
         if self.system_capacity_kwh:
             return self.Outputs.gen
         else:
             return [0] * self.site.n_timesteps
 
-    
     @generation_profile.setter
     def generation_profile(self, gen: list):
         self.Outputs.gen = gen
+
+    @property
+    def replacement_costs(self) -> Sequence:
+        if self.system_capacity_kw:
+            return self._financial_model.Outputs.cf_battery_replacement_cost
+        else:
+            return [0] * self.site.n_timesteps
+
+    @property
+    def annual_energy_kwh(self) -> float:
+        if self.system_capacity_kw > 0:
+            return sum(self.Outputs.gen)
+        else:
+            return 0

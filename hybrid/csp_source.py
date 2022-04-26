@@ -70,7 +70,7 @@ class CspPlant(PowerSource):
                  csp_config: dict):
         """
 
-        :param trough_config: dict, with keys ('system_capacity_kw', 'solar_multiple', 'tes_hours')
+        :param csp_config: dict, with keys ('system_capacity_kw', 'solar_multiple', 'tes_hours')
         """
         required_keys = ['cycle_capacity_kw', 'solar_multiple', 'tes_hours']
         if any(key not in csp_config.keys() for key in required_keys):
@@ -85,6 +85,7 @@ class CspPlant(PowerSource):
         self._layout = None
         self._dispatch: CspDispatch = None
         self.set_construction_financing_cost_per_kw(0)
+        self.initialize_financial_values()
 
         # TODO: Should 'SSC' object be a protected attr
         # Initialize ssc and get weather data
@@ -305,8 +306,7 @@ class CspPlant(PowerSource):
     def get_tes_soc(self, time_hr):
         i = int(time_hr * self.ssc.get('time_steps_per_hour'))
         tes_charge = self.outputs.ssc_time_series['e_ch_tes'][i]
-        tes_capacity = self.cycle_thermal_rating * self.tes_hours
-        return (tes_charge / tes_capacity) * 100
+        return (tes_charge / self.tes_capacity) * 100
     
     def get_cycle_load(self, time_hr):
         i = int(time_hr * self.ssc.get('time_steps_per_hour'))
@@ -387,6 +387,22 @@ class CspPlant(PowerSource):
         thermal_est_name_map = {'TowerPlant': 'Q_thermal', 'TroughPlant': 'qsf_expected'}
         self.solar_thermal_resource = [max(heat, 0.0) for heat in ssc_outputs[thermal_est_name_map[type(self).__name__]]]
 
+    def scale_params(self, params: list = ['tank_heaters', 'tank_height']):
+        """
+        Scales absolute parameters within the CSP models when design changes
+        """
+        if 'tank_heaters' in params:
+            cold_heater = 15 * (self.tes_capacity / 2791.3)       # ssc default is 15 MWe with 2791.3 MWt-hr TES capacity
+            hot_heater = 30 * (self.tes_capacity / 2791.3)      # ssc default is 30 MWe with 2791.3 MWt-hr TES capacity
+            self.ssc.set({'cold_tank_max_heat': cold_heater, 'hot_tank_max_heat': hot_heater})
+
+        if 'tank_height' in params:
+            tank_min = self.value("h_tank_min")
+            # assuming a constant aspect ratio h/d
+            height = ((12 - tank_min)**3 * self.tes_capacity / 2791.3)**(1/3) + tank_min
+            # ssc default is 12 m with 2791.3 MWt-hr TES capacity
+            self.ssc.set({'h_tank': height})
+
     def simulate_with_dispatch(self, n_periods: int, sim_start_time: int = None, store_outputs: bool = True):
         """
         Step through dispatch solution and simulate trough system
@@ -440,8 +456,7 @@ class CspPlant(PowerSource):
 
     def get_design_storage_mass(self):
         """Returns active storage mass [kg]"""
-        q_pb_design = self.cycle_thermal_rating
-        e_storage = q_pb_design * self.tes_hours * 1000.  # Storage capacity (kWht)
+        e_storage = self.tes_capacity * 1000.  # Storage capacity (kWht)
         cp = self.get_cp_htf(0.5 * (self.htf_hot_design_temperature + self.htf_cold_design_temperature)) * 1.e-3  # kJ/kg/K
         m_storage = e_storage * 3600. / cp / (self.htf_hot_design_temperature - self.htf_cold_design_temperature)
         return m_storage
@@ -481,6 +496,7 @@ class CspPlant(PowerSource):
         self._construction_financing_cost_per_kw = construction_financing_cost_per_kw
 
     def get_construction_financing_cost(self) -> float:
+        # TODO: do we need to set to zero for consistency with other technologies
         cf = ssc_wrap('pyssc', 'cb_construction_financing', None)
         with open(self.param_files['cf_params_path'], 'r') as f:
             params = rapidjson.load(f)
@@ -499,7 +515,12 @@ class CspPlant(PowerSource):
         """
         raise NotImplementedError
 
-    def simulate_financials(self, project_life):
+    def simulate_financials(self, interconnect_kw, project_life, cap_cred_avail_storage: bool = True):
+        """
+        :param: project_life:
+        :param: cap_cred_avail_storage: Base capacity credit on available storage (True),
+                                            otherwise use only dispatched generation (False)
+        """
         if project_life > 1:
             self._financial_model.Lifetime.system_use_lifetime_output = 1
         else:
@@ -507,14 +528,16 @@ class CspPlant(PowerSource):
         self._financial_model.FinancialParameters.analysis_period = project_life
 
         nameplate_capacity_kw = self.cycle_capacity_kw * self.ssc.get('gross_net_conversion_factor')  # TODO: avoid using ssc data here?
-        self._financial_model.value("system_capacity", nameplate_capacity_kw)
-        self._financial_model.value("cp_system_nameplate", nameplate_capacity_kw/1000)
+        self._financial_model.value("system_capacity", min(nameplate_capacity_kw, interconnect_kw))
+        self._financial_model.value("cp_system_nameplate", min(nameplate_capacity_kw, interconnect_kw))
         self._financial_model.value("total_installed_cost", self.calculate_total_installed_cost())
-        self._financial_model.value("construction_financing_cost", self.get_construction_financing_cost())
-        self.gen_max_feasible = self.calc_gen_max_feasible_kwh()      # need to store for later grid aggregation
+        # self._financial_model.value("construction_financing_cost", self.get_construction_financing_cost())
+        # need to store for later grid aggregation
+        self.gen_max_feasible = self.calc_gen_max_feasible_kwh(interconnect_kw, cap_cred_avail_storage)
         self.capacity_credit_percent = self.calc_capacity_credit_percent(
-            self.net_load_hourly_year(self.site.data['year']),
-            self.gen_max_feasible)
+            self.site.capacity_hours,
+            self.gen_max_feasible,
+            interconnect_kw)
         
         self._financial_model.Revenue.ppa_soln_mode = 1
 
@@ -528,7 +551,7 @@ class CspPlant(PowerSource):
         self._financial_model.execute(0)
         logger.info("{} simulation executed".format(str(type(self).__name__)))
 
-    def calc_gen_max_feasible_kwh(self) -> list:
+    def calc_gen_max_feasible_kwh(self, interconnect_kw, cap_cred_avail_storage: bool = True) -> list:
         """
         Calculates the maximum feasible generation profile that could have occurred.
 
@@ -537,13 +560,16 @@ class CspPlant(PowerSource):
         same timestep (off, startup, on). This makes determining how long the power block (pb) is on,
         and thus its precise max generating potential, currently undeterminable.
 
+        :param: cap_cred_avail_storage: bool if capacity credit should be based on available storage (true),
+                                            o.w. based on generation profile only (false)
+
         :return: maximum feasible generation [kWh]: list of floats
         """
         SIGMA = 1e-6
 
         # Verify power block startup does not span timesteps
-        t_step = self._system_model.value("time_steps_per_hour")                            # [hr]
-        if self._system_model.value("startup_time") > t_step:
+        t_step = self.value("time_steps_per_hour")                            # [hr]
+        if self.value("startup_time") > t_step:
             raise NotImplementedError("Capacity credit calculations have not been implemented \
                                       for power block startup times greater than one timestep.")
 
@@ -553,6 +579,8 @@ class CspPlant(PowerSource):
         df['W_pb_gross'] = [x * 1e3 for x in self.outputs.ssc_time_series["P_cycle"]]               # [kWe] Always average over entire timestep
         df['E_tes'] = [x * 1e3 for x in self.outputs.ssc_time_series["e_ch_tes"]]                   # [kWht]
         df['eta_pb'] = self.outputs.ssc_time_series["eta"]                                          # [-]
+        df['W_pb_net'] = [x * 1e3 for x in self.outputs.ssc_time_series["P_out_net"]]  # kWe 
+        df['Q_pb'] = [x * 1e3 for x in self.outputs.ssc_time_series["q_pb"]]  # kWt 
 
         def power_block_state(Q_pb_startup, W_pb_gross):
             """Simplified power block operating states.
@@ -593,20 +621,25 @@ class CspPlant(PowerSource):
 
             # 1. What's the maximum the power block could generate with unlimited resource, outside of startup time?
             if state == 'off':
-                t_pb_startup = self._system_model.value("startup_time")                 # [hr]
+                t_pb_startup = self.value("startup_time")                 # [hr]
             elif state == 'started':
-                t_pb_startup = row.E_pb_startup / row.Q_pb_startup \
-                                if row.E_pb_startup > SIGMA and \
-                                row.Q_pb_startup > SIGMA \
-                                else 0
+                #t_pb_startup = row.E_pb_startup / row.Q_pb_startup \
+                #                if row.E_pb_startup > SIGMA and \
+                #                row.Q_pb_startup > SIGMA \
+                #                else 0  #TODO: reported q_dot_pc_startup is timestep average so t_pb_startup = t_step from this calculation
+
+                t_pb_startup  = t_step * (1.0 - row.eta_pb / (row.W_pb_gross / (row.Q_pb - row.Q_pb_startup)))  \
+                                if row.E_pb_startup > SIGMA and row.Q_pb_startup > SIGMA \
+                                else 0    # Fraction of timestep used for startup = 1.0 - (timestep-averaged efficiency / instantaneous efficiency while on)             
+
             elif state == 'on':
                 t_pb_startup = 0
             else:
                 return None
-            W_pb_nom = self._system_model.value("P_ref") * 1e3                          # [kWe]
-            f_pb_max = self._system_model.value("cycle_max_frac")                       # [-]
+            W_pb_nom = self.cycle_capacity_kw                                           # [kWe]
+            f_pb_max = self.value("cycle_max_frac")                       # [-]
             W_pb_max = W_pb_nom * f_pb_max                                              # [kWe]
-            E_pb_max = W_pb_max * (t_step - t_pb_startup)                               # [kWhe]
+            E_pb_max = max(W_pb_max * (t_step - t_pb_startup), row.W_pb_gross * t_step)  # [kWhe]  
 
             # 2. What did the power block actually generate?
             if state == 'off':
@@ -618,8 +651,8 @@ class CspPlant(PowerSource):
 
             # 3. What more could the power block generate if it used all the remaining TES (with no physical constraints)?
             if state == 'off':
-                eta_pb_nom = self._system_model.value("design_eff")                     # [-]
-                f_pb_startup_of_nominal = self._system_model.value("startup_frac")      # [-]
+                eta_pb_nom = self.cycle_nominal_efficiency                     # [-]
+                f_pb_startup_of_nominal = self.value("startup_frac")      # [-]
                 E_pb_startup = W_pb_nom / eta_pb_nom * f_pb_startup_of_nominal * t_pb_startup  # [kWht]
                 dE_pb_rest_of_tes = max(0, row.E_tes - E_pb_startup) * eta_pb_nom              # [kWht]
             elif state == 'started' or state == 'on':
@@ -628,14 +661,18 @@ class CspPlant(PowerSource):
                 return None
 
             # 4. Thus, what could the power block have generated if it utilized more TES?
-            E_pb_gross_max_feasible = min(E_pb_max, \
-                                            E_pb_gross + dE_pb_rest_of_tes)             # [kWhe]
-            f_gross_to_net = self._system_model.value("gross_net_conversion_factor")    # [-]
-            E_pb_net_max_feasible = E_pb_gross_max_feasible * f_gross_to_net            # [kWhe]
-            return E_pb_net_max_feasible
+            E_pb_gross_max_feasible = min(E_pb_max, E_pb_gross + dE_pb_rest_of_tes)     # [kWhe]
+            return E_pb_gross_max_feasible
 
-        E_pb_net_max_feasible = df.apply(max_feasible_kwh, axis=1)                      # [kWhe]
-        return list(E_pb_net_max_feasible)
+        if cap_cred_avail_storage:
+            E_pb_max_feasible = np.maximum(df['W_pb_net']*t_step, df.apply(max_feasible_kwh, axis=1)*self.value('gross_net_conversion_factor')) # [kWhe]
+        else:
+            E_pb_max_feasible = df['W_pb_net']*t_step 
+
+        W_ac_nom = self.calc_nominal_capacity(interconnect_kw)
+        E_pb_max_feasible = np.minimum(E_pb_max_feasible, W_ac_nom*t_step)  # Limit to nominal capacity here, to avoid discrepancies between single-technology and hybrid capacity credits
+
+        return list(E_pb_max_feasible)
 
     def value(self, var_name, var_value=None):
         attr_obj = None
@@ -727,6 +764,13 @@ class CspPlant(PowerSource):
         :return:
         """
         self.ssc.set({'tshours': tes_hours})
+
+    @property
+    def tes_capacity(self) -> float:
+        """
+        # [MWt-hr]
+        """
+        return self.cycle_thermal_rating * self.tes_hours
 
     @property
     def cycle_thermal_rating(self) -> float:

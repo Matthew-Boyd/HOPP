@@ -1,4 +1,4 @@
-NREL-PySAM==2.2.2
+NREL-PySAM==2.2.4
 Pillow
 Pyomo>=6.1.2
 humpday
@@ -21,7 +21,6 @@ pandas
 pint
 pvmismatch
 pysolar
-pytest
 python-dotenv
 pytz
 requests

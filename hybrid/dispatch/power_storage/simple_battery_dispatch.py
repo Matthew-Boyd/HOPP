@@ -30,14 +30,17 @@ class SimpleBatteryDispatch(PowerStorageDispatch):
 
     def initialize_parameters(self):
         if self.include_lifecycle_count:
-            self.lifecycle_cost = 0.01 * self._system_model.value('nominal_energy')  # TODO: update value
+            # Estimated using SAM output
+            # TODO: make mutable
+            self.lifecycle_cost = 0.0265 * self._system_model.value('nominal_energy')
 
         om_cost = self._financial_model.value("om_capacity")[0] * 1e3 / 8760.
         self.cost_per_charge = om_cost / 2
         self.cost_per_discharge = om_cost / 2
         self.minimum_power = 0.0
         # FIXME: Change C_rate call to user set system_capacity_kw
-        self.maximum_power = self._system_model.value('nominal_energy') * self._system_model.value('C_rate') / 1e3
+        # self.maximum_power = self._system_model.value('nominal_energy') * self._system_model.value('C_rate') / 1e3
+        self.maximum_power = self._financial_model.value("system_capacity") / 1e3
         self.minimum_soc = self._system_model.value('minimum_SOC')
         self.maximum_soc = self._system_model.value('maximum_SOC')
         self.initial_soc = self._system_model.value('initial_SOC')
@@ -51,7 +54,7 @@ class SimpleBatteryDispatch(PowerStorageDispatch):
         self.control_variable = "input_power"
 
     def _set_model_specific_parameters(self):
-        self.round_trip_efficiency = 95.0  # 90
+        self.round_trip_efficiency = 88.0  # Including converter efficiency
         self.capacity = self._system_model.value('nominal_energy') / 1e3  # [MWh]
 
     def update_time_series_parameters(self, start_time: int):

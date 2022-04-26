@@ -106,6 +106,22 @@ class HybridDispatchBuilderSolver:
             self.options)
         return model
 
+    def solve_dispatch_model(self, start_time: int, n_days: int):
+        # Solve dispatch model
+        if self.options.solver == 'glpk':
+            solver_results = self.glpk_solve()  # TODO: need to condition for other non-convex model
+        elif self.options.solver == 'cbc':
+            solver_results = self.cbc_solve()
+        elif self.options.solver == 'xpress':
+            solver_results = self.xpress_solve()
+        elif self.options.solver == 'gurobi_ampl':
+            solver_results = self.gurobi_ampl_solve()
+        else:
+            raise ValueError("{} is not a supported solver".format(self.options.solver))
+
+        self.problem_state.store_problem_metrics(solver_results, start_time, n_days,
+                                                 self.dispatch.objective_value)
+
     @staticmethod
     def glpk_solve_call(pyomo_model: pyomo.ConcreteModel,
                         log_name: str = "",
@@ -121,7 +137,7 @@ class HybridDispatchBuilderSolver:
                               'presol': None,
                               # 'mostf': None,
                               # 'mipgap': 0.001,
-                              'tmlim': 20
+                              'tmlim': 30
                               }
             if log_name != "":
                 solver_options['log'] = "dispatch_solver.log"
@@ -189,7 +205,7 @@ class HybridDispatchBuilderSolver:
         # Solver options can be found by launching executable 'start cbc.exe', verbose 15, ?
         # https://coin-or.github.io/Cbc/faq.html (a bit outdated)
         solver_options = {  # 'ratioGap': 0.001,
-                          'seconds': 20}
+                          'seconds': 60}
 
         if sys.platform == 'win32' or sys.platform == 'cygwin':
             cbc_path = Path(__file__).parent / "cbc_solver" / "cbc-win64" / "cbc"
@@ -214,7 +230,8 @@ class HybridDispatchBuilderSolver:
             solver = pyomo.SolverFactory('cbc')
             solver_options.update(user_solver_options)
             results = solver.solve(pyomo_model, options=solver_options)
-            HybridDispatchBuilderSolver.append_solve_to_log(log_name, solver_options['log'])
+            if log_name != "":
+                HybridDispatchBuilderSolver.append_solve_to_log(log_name, solver_options['log'])
         else:
             raise SystemError('Platform not supported ', sys.platform)
 
@@ -231,20 +248,55 @@ class HybridDispatchBuilderSolver:
                                                           self.options.solver_options)
 
     @staticmethod
+    def xpress_solve_call(pyomo_model: pyomo.ConcreteModel,
+                          log_name: str = "",
+                          user_solver_options: dict = None):
+
+        # log_name = "annual_solve_Xpress.log"  # For debugging MILP solver
+        if user_solver_options is None:
+            user_solver_options = {}
+
+        with pyomo.SolverFactory('xpress_direct') as solver:
+            # Ref. on solver options: https://en.wikibooks.org/wiki/GLPK/Using_GLPSOL
+            solver_options = {'mipgap': 0.001,
+                              #'GOMCUTS':0,
+                              #'TREECOVERCUTS':0,
+                              'MAXTIME': 30,
+                              }
+            if log_name != "":
+                solver_options['LOGFILE'] = "dispatch_solver.log"
+
+            solver_options.update(user_solver_options)
+            results = solver.solve(pyomo_model, options=solver_options)
+
+        if log_name != "":
+            HybridDispatchBuilderSolver.append_solve_to_log(log_name, solver_options['log'])
+
+        if results.solver.termination_condition == TerminationCondition.infeasible:
+            HybridDispatchBuilderSolver.print_infeasible_problem(pyomo_model)
+        elif not results.solver.termination_condition == TerminationCondition.optimal:
+            print("Warning: Dispatch problem termination condition was '"
+                  + str(results.solver.termination_condition) + "'")
+        return results
+
+    def xpress_solve(self):
+        return HybridDispatchBuilderSolver.xpress_solve_call(self.pyomo_model,
+                                                             self.options.log_name,
+                                                             self.options.solver_options)
+
+    @staticmethod
     def mindtpy_solve_call(pyomo_model: pyomo.ConcreteModel,
-                           log_name: str = None):
+                           log_name: str = ""):
         # FIXME: This does not work!
         solver = pyomo.SolverFactory('mindtpy')
-
-        if log_name is not None:
-            solver_options = {'log': 'dispatch_instance.log'}
 
         results = solver.solve(pyomo_model,
                                mip_solver='glpk',
                                nlp_solver='ipopt',
                                tee=True)
 
-        if log_name is not None:
+        if log_name != "":
+            solver_options = {'log': 'dispatch_instance.log'}
             HybridDispatchBuilderSolver.append_solve_to_log(log_name, solver_options['log'])
 
         if results.solver.termination_condition == TerminationCondition.infeasible:
@@ -301,11 +353,12 @@ class HybridDispatchBuilderSolver:
 
     def simulate(self):
         # Dispatch Optimization Simulation with Rolling Horizon
-        # Solving the year in series
+        print("Simulating system with dispatch optimization...")
         ti = list(range(0, self.site.n_timesteps, self.options.n_roll_periods))
         self.dispatch.initialize_parameters()
 
         if self.clustering is None:
+            # Solving the year in series
             for i, t in enumerate(ti):
                 if self.options.is_test_start_year or self.options.is_test_end_year:
                     if (self.options.is_test_start_year and i < 5) or (self.options.is_test_end_year and i > 359):
@@ -319,6 +372,8 @@ class HybridDispatchBuilderSolver:
                         # TODO: can we make the csp and battery model run with heuristic dispatch here?
                         #  Maybe calling a simulate_with_heuristic() method
                 else:
+                    if (i % 73) == 0:
+                        print("\t {:.0f} % complete".format(i*20/73))
                     self.simulate_with_dispatch(t)
         else:
 
@@ -353,14 +408,12 @@ class HybridDispatchBuilderSolver:
                             elif tech in ['battery']:
                                 step = day*24 * int(self.site.n_timesteps/8760)
                                 initial_states[tech]['soc'].append(self.power_sources[tech].Outputs.SOC[step])
- 
 
             # After exemplar simulations, update to full annual generation array for dispatchable technologies
             for tech in ['battery', 'trough', 'tower']:
                 if tech in self.power_sources.keys():
                     gen = self.power_sources[tech].generation_profile
                     self.power_sources[tech].generation_profile = list(self.clustering.compute_annual_array_from_cluster_exemplar_data(gen))
-
 
     def simulate_with_dispatch(self,
                                start_time: int,
@@ -383,21 +436,29 @@ class HybridDispatchBuilderSolver:
                     continue
                 model.dispatch.update_time_series_parameters(sim_start_time)
 
-            # TODO: this is not a good way to do this... This won't work with CSP addition...
+            if self.site.follow_desired_schedule:
+                n_horizon = len(self.power_sources['grid'].dispatch.blocks.index_set())
+                if start_time + n_horizon > len(self.site.desired_schedule):
+                    system_limit = list(self.site.desired_schedule[start_time:])
+                    system_limit.extend(list(self.site.desired_schedule[0:n_horizon - len(system_limit)]))
+                else:
+                    system_limit = self.site.desired_schedule[start_time:start_time + n_horizon]
+
+                transmission_limit = self.power_sources['grid'].value('grid_interconnection_limit_kwac') / 1e3
+                for count, value in enumerate(system_limit):
+                    if value > transmission_limit:
+                        print('Warning: Desired schedule is greater than transmission limit. '
+                              'Overwriting schedule to transmission limit')
+                        system_limit[count] = transmission_limit
+
+                self.power_sources['grid'].dispatch.generation_transmission_limit = system_limit
+
             if 'heuristic' in self.options.battery_dispatch:
+                # TODO: this is not a good way to do this... This won't work with CSP addition...
                 self.battery_heuristic()
                 # TODO: we could just run the csp model without dispatch here
             else:
-                # Solve dispatch model
-                if self.options.solver == 'glpk':
-                    solver_results = self.glpk_solve()       # TODO: need to condition for other non-convex model
-                elif self.options.solver == 'cbc':
-                    solver_results = self.cbc_solve()
-                else:
-                    raise ValueError("{} is not a supported solver".format(self.options.solver))
-
-                self.problem_state.store_problem_metrics(solver_results, start_time, n_days,
-                                                         self.dispatch.objective_value)
+                self.solve_dispatch_model(start_time, n_days)
             
             store_outputs = True
             battery_sim_start_time = sim_start_time
@@ -413,11 +474,11 @@ class HybridDispatchBuilderSolver:
             if 'trough' in self.power_sources.keys():
                 self.power_sources['trough'].simulate_with_dispatch(self.options.n_roll_periods,
                                                                     sim_start_time=sim_start_time,
-                                                                    store_outputs = store_outputs)
+                                                                    store_outputs=store_outputs)
             if 'tower' in self.power_sources.keys():
                 self.power_sources['tower'].simulate_with_dispatch(self.options.n_roll_periods,
                                                                    sim_start_time=sim_start_time,
-                                                                   store_outputs = store_outputs)
+                                                                   store_outputs=store_outputs)
 
     def battery_heuristic(self):
         tot_gen = [0.0]*self.options.n_look_ahead_periods
@@ -428,7 +489,7 @@ class HybridDispatchBuilderSolver:
             wind_gen = self.power_sources['wind'].dispatch.available_generation
             tot_gen = [wind + gen for wind, gen in zip(wind_gen, tot_gen)]
 
-        grid_limit = self.power_sources['grid'].dispatch.transmission_limit
+        grid_limit = self.power_sources['grid'].dispatch.generation_transmission_limit
 
         if 'one_cycle' in self.options.battery_dispatch:
             # Get prices for one cycle heuristic
