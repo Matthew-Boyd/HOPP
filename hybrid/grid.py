@@ -1,4 +1,4 @@
-from typing import Sequence
+from typing import Sequence, Any
 
 import PySAM.Grid as GridModel
 import PySAM.Singleowner as Singleowner
@@ -9,9 +9,9 @@ from hybrid.dispatch.grid_dispatch import GridDispatch
 
 class Grid(PowerSource):
     _system_model: GridModel.Grid
-    _financial_model: Singleowner.Singleowner
+    _financial_model: Any
 
-    def __init__(self, site: SiteInfo, interconnect_kw):
+    def __init__(self, site: SiteInfo, interconnect_kw, financial_model=None):
         """
         Class that houses the hybrid system performance and financials. Enforces interconnection and curtailment
         limits based on PySAM's Grid module
@@ -19,10 +19,13 @@ class Grid(PowerSource):
         :param site: Power source site information (SiteInfo object)
         :param interconnect_kw: Interconnection limit [kW]
         """
-        system_model = GridModel.default("GenericSystemSingleOwner")
+        if financial_model is None:
+            system_model = GridModel.default("GenericSystemSingleOwner")
+            financial_model = Singleowner.from_existing(system_model, "GenericSystemSingleOwner")
+        else:
+            system_model = GridModel.default("GenericSystemNone")
+            # TODO: set grid model reference in financial model
 
-        financial_model: Singleowner.Singleowner = Singleowner.from_existing(system_model,
-                                                                             "GenericSystemSingleOwner")
         super().__init__("Grid", site, system_model, financial_model)
 
         self._system_model.GridLimits.enable_interconnection_limit = 1

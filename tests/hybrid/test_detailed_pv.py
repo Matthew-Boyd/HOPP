@@ -212,8 +212,13 @@ def test_hybrid_pv_plants(site):
     assert pv_plant._system_model.Outputs.capacity_factor == approx(18.15, 1e-2)
 
     # Test DetailedPVPlant run in a hybrid simulation
+    # grid_config = {
+    #     'fin_config': 
+    # }
+
     power_sources = {
-        'pv': pv_config
+        'pv': pv_config,
+        # 'grid': grid_config,
     }
     hybrid_plant = HybridSimulation(
         power_sources,
